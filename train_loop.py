@@ -8,15 +8,15 @@ import random
 import time
 from dataclasses import dataclass, asdict
 from typing import Tuple, Dict, Any, Optional
-from checkpointing import save_checkpoint, load_checkpoint
+
 import numpy as np
 import torch
 
+from checkpointing import save_checkpoint, load_checkpoint
+from cross_entropy import cross_entropy as user_cross_entropy
+from data_loader import load_tokenized_ids, get_batch
+from learning_rate_schedule import lr_cosine_with_warmup
 from transformer_lm import TransformerLM  # your GPT-style LM
-
-
-from cross_entropy import cross_entropy as user_cross_entropy  # <- adjust name if needed
-
 
 
 # optimizer choices (your implementations)
@@ -35,13 +35,6 @@ try:
     from gradient_clipping import clip_grad_l2_norm_
 except Exception:
     clip_grad_l2_norm_ = None
-
-from learning_rate_schedule import lr_cosine_with_warmup
-
-try:
-    import checkpointing as user_ckpt
-except Exception:
-    user_ckpt = None
 
 
 # =========================
@@ -82,7 +75,6 @@ class OptimCfg:
 class TrainCfg:
     train_tokens_path: str
     val_tokens_path: str
-    token_dtype: str
     batch_size: int
     total_steps: int
     grad_accum_steps: int
@@ -110,62 +102,6 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _dtype_from_str(s: str) -> np.dtype:
-    s = s.lower()
-    if s in ["uint16", "u2"]:
-        return np.uint16
-    if s in ["int32", "i4"]:
-        return np.int32
-    if s in ["int64", "i8"]:
-        return np.int64
-    raise ValueError(f"Unsupported token dtype: {s} (use uint16/int32/int64)")
-
-
-def load_tokens_memmap(path: str, dtype: np.dtype) -> np.ndarray:
-    """
-    Load 1D token array with memory-mapped IO.
-    Supports:
-      - .npy  (np.load(..., mmap_mode='r'))
-      - .bin  (np.memmap)
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-
-    if path.endswith(".npy"):
-        arr = np.load(path, mmap_mode="r")
-        if arr.ndim != 1:
-            raise ValueError(f"{path} must be a 1D token array, got shape={arr.shape}")
-        return arr
-
-    if path.endswith(".bin"):
-        itemsize = np.dtype(dtype).itemsize
-        n = os.path.getsize(path) // itemsize
-        arr = np.memmap(path, dtype=dtype, mode="r", shape=(n,))
-        return arr
-
-    raise ValueError(f"Unsupported token file: {path} (use .npy or .bin)")
-
-
-@torch.no_grad()
-def get_batch(tokens_1d: np.ndarray, batch_size: int, context_length: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Sample random (x, y) from a long 1D token stream.
-      x: (B, T)
-      y: (B, T) = next-token labels (aligned with logits at each position)
-    """
-    n = int(tokens_1d.shape[0])
-    if n <= context_length + 1:
-        raise ValueError(f"Token stream too short: n={n}, context_length={context_length}")
-
-    starts = np.random.randint(0, n - context_length - 1, size=(batch_size,))
-    x_np = np.stack([tokens_1d[s : s + context_length] for s in starts], axis=0)
-    y_np = np.stack([tokens_1d[s + 1 : s + 1 + context_length] for s in starts], axis=0)
-
-    x = torch.from_numpy(np.asarray(x_np)).long().to(device, non_blocking=True)
-    y = torch.from_numpy(np.asarray(y_np)).long().to(device, non_blocking=True)
-    return x, y
-
-
 def _zero_grad_compat(optimizer: Any) -> None:
     if not hasattr(optimizer, "zero_grad"):
         return
@@ -176,10 +112,16 @@ def _zero_grad_compat(optimizer: Any) -> None:
 
 
 def set_optimizer_lr(optimizer: Any, lr: float) -> None:
+    # Most torch-like optimizers
     if hasattr(optimizer, "param_groups"):
         for pg in optimizer.param_groups:
-            pg["lr"] = lr
+            # some custom student optimizers may name lr as "alpha"
+            if "alpha" in pg:
+                pg["alpha"] = lr
+            else:
+                pg["lr"] = lr
         return
+    # custom optimizers
     if hasattr(optimizer, "lr"):
         optimizer.lr = lr
         return
@@ -190,30 +132,16 @@ def set_optimizer_lr(optimizer: Any, lr: float) -> None:
 
 
 def compute_lr(step: int, opt_cfg: OptimCfg) -> float:
-    if lr_cosine_with_warmup is not None:
-        return float(
-            lr_cosine_with_warmup(
-                t=step,
-                alpha_max=opt_cfg.lr_max,
-                alpha_min=opt_cfg.lr_min,
-                Tw=opt_cfg.warmup_steps,
-                Tc=opt_cfg.cosine_end_step,
-            )
+    return float(
+        lr_cosine_with_warmup(
+            t=step,
+            alpha_max=opt_cfg.lr_max,
+            alpha_min=opt_cfg.lr_min,
+            Tw=opt_cfg.warmup_steps,
+            Tc=opt_cfg.cosine_end_step,
         )
+    )
 
-    # fallback (assignment definition)
-    t = step
-    Tw = opt_cfg.warmup_steps
-    Tc = opt_cfg.cosine_end_step
-    amax = opt_cfg.lr_max
-    amin = opt_cfg.lr_min
-
-    if t < Tw:
-        return (t / max(1, Tw)) * amax
-    if t <= Tc:
-        progress = (t - Tw) / max(1, (Tc - Tw))
-        return amin + 0.5 * (1.0 + math.cos(progress * math.pi)) * (amax - amin)
-    return amin
 
 def build_optimizer(model: torch.nn.Module, opt_cfg: OptimCfg):
     params = list(model.parameters())
@@ -238,8 +166,6 @@ def build_optimizer(model: torch.nn.Module, opt_cfg: OptimCfg):
     raise ValueError(f"Unknown optimizer: {opt_cfg.optimizer} (use adamw/sgd)")
 
 
-
-
 def round_up_to_multiple(x: int, multiple: int) -> int:
     if multiple <= 1:
         return x
@@ -250,19 +176,6 @@ def swiglu_default_dff(d_model: int, multiple: int) -> int:
     # d_ff ≈ (8/3) * d_model, then round up for matmul efficiency
     raw = int(math.ceil((8.0 * d_model) / 3.0))
     return round_up_to_multiple(raw, multiple)
-
-
-def compute_loss_with_user_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """
-    Use your cross_entropy.py:
-      cross_entropy(logits: (*, V), targets: (*,))
-    Here we feed logits (B,T,V) and targets (B,T) directly.
-    """
-    if user_cross_entropy is None:
-        raise ImportError(f"Failed to import cross_entropy from cross_entropy.py")
-    return user_cross_entropy(logits, targets)
-
-
 
 
 @torch.no_grad()
@@ -282,7 +195,7 @@ def estimate_loss(
         for _ in range(eval_iters):
             x, y = get_batch(tokens, batch_size, context_length, device)
             logits = model(x)  # (B,T,V)
-            loss = compute_loss_with_user_ce(logits, y)
+            loss = user_cross_entropy(logits, y)
             losses.append(float(loss.item()))
         out[split] = float(np.mean(losses))
     model.train()
@@ -296,9 +209,18 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
     p = argparse.ArgumentParser("CS336 training loop (assembled from your components)")
 
     # data
-    p.add_argument("--train_tokens", type=str, required=True, help="Path to 1D token ids (.npy or .bin)")
-    p.add_argument("--val_tokens", type=str, required=True, help="Path to 1D token ids (.npy or .bin)")
-    p.add_argument("--token_dtype", type=str, default="uint16", help="uint16/int32/int64 (for .bin)")
+    p.add_argument(
+        "--train_tokens",
+        type=str,
+        required=True,
+        help="Tokenized ids filename (under tokenized_ids/) or a full path to a .npy/.npz file.",
+    )
+    p.add_argument(
+        "--val_tokens",
+        type=str,
+        required=True,
+        help="Tokenized ids filename (under tokenized_ids/) or a full path to a .npy/.npz file.",
+    )
 
     # model core
     p.add_argument("--vocab_size", type=int, required=True)
@@ -308,8 +230,18 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
     p.add_argument("--num_heads", type=int, default=6)
 
     # SwiGLU d_ff
-    p.add_argument("--d_ff", type=int, default=-1, help="FFN hidden size. If -1, use SwiGLU default (ceil(8/3*d_model))")
-    p.add_argument("--d_ff_multiple", type=int, default=64, help="Round d_ff up to this multiple (default 64)")
+    p.add_argument(
+        "--d_ff",
+        type=int,
+        default=-1,
+        help="FFN hidden size. If -1, use SwiGLU default (ceil(8/3*d_model))",
+    )
+    p.add_argument(
+        "--d_ff_multiple",
+        type=int,
+        default=64,
+        help="Round d_ff up to this multiple (default 64)",
+    )
 
     # model extras (aligned with your TransformerLM)
     p.add_argument("--dropout", type=float, default=0.0)
@@ -324,66 +256,56 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
 
     # train
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--total_steps", type=int, default=20000)
+    p.add_argument("--total_steps", type=int, default=2000)
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-
     p.add_argument("--log_every", type=int, default=50)
-    p.add_argument("--eval_every", type=int, default=500)
+    p.add_argument("--eval_every", type=int, default=200)
     p.add_argument("--eval_iters", type=int, default=50)
-    p.add_argument("--save_every", type=int, default=1000)
-
+    p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--save_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--seed", type=int, default=1337)
 
-    # optim + schedule
-    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd"])
+    # optimizer + schedule
+    p.add_argument("--optimizer", type=str, default="adamw", help="adamw/sgd")
     p.add_argument("--lr_max", type=float, default=3e-4)
     p.add_argument("--lr_min", type=float, default=3e-5)
-    p.add_argument("--warmup_steps", type=int, default=2000)
-    p.add_argument("--cosine_end_step", type=int, default=-1, help="Tc; default=total_steps-1")
+    p.add_argument("--warmup_steps", type=int, default=200)
+    p.add_argument("--cosine_end_step", type=int, default=-1, help="Tc (if -1, uses total_steps-1)")
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--optim_eps", type=float, default=1e-8)
-    p.add_argument("--momentum", type=float, default=0.9)
+    p.add_argument("--momentum", type=float, default=0.0)
 
-    # system
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=1337)
-
-    # logging
+    # wandb
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="cs336")
     p.add_argument("--wandb_name", type=str, default="run")
 
     args = p.parse_args()
 
-    # d_ff
-    if args.d_ff is None or args.d_ff < 0:
-        d_ff = swiglu_default_dff(args.d_model, args.d_ff_multiple)
+    dff_multiple = int(args.d_ff_multiple)
+    if int(args.d_ff) < 0:
+        d_ff = swiglu_default_dff(int(args.d_model), multiple=dff_multiple)
     else:
-        d_ff = round_up_to_multiple(int(args.d_ff), int(args.d_ff_multiple))
+        d_ff = int(args.d_ff)
 
-    # bias flag resolution (your LM default bias=True)
-    bias = True
-    if args.no_bias:
-        bias = False
-    elif args.bias:
-        bias = True
-
-    use_rope = not args.no_rope
-    tie_weights = not args.no_tie_weights
-
-    emb_dropout = None if args.emb_dropout < 0 else float(args.emb_dropout)
+    # flags
+    bias = False if bool(args.no_bias) else True
+    use_rope = False if bool(args.no_rope) else True
+    tie_weights = False if bool(args.no_tie_weights) else True
+    emb_dropout = None if float(args.emb_dropout) < 0 else float(args.emb_dropout)
 
     model_cfg = ModelCfg(
-        vocab_size=args.vocab_size,
-        context_length=args.context_length,
-        num_layers=args.num_layers,
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        d_ff=d_ff,
+        vocab_size=int(args.vocab_size),
+        context_length=int(args.context_length),
+        num_layers=int(args.num_layers),
+        d_model=int(args.d_model),
+        num_heads=int(args.num_heads),
+        d_ff=int(d_ff),
         dropout=float(args.dropout),
         bias=bool(bias),
         eps=float(args.eps),
@@ -410,7 +332,6 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
     train_cfg = TrainCfg(
         train_tokens_path=args.train_tokens,
         val_tokens_path=args.val_tokens,
-        token_dtype=args.token_dtype,
         batch_size=args.batch_size,
         total_steps=args.total_steps,
         grad_accum_steps=args.grad_accum_steps,
@@ -428,7 +349,7 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
         wandb_name=args.wandb_name,
     )
 
-    return model_cfg, opt_cfg, train_cfg, args.d_ff_multiple
+    return model_cfg, opt_cfg, train_cfg, dff_multiple
 
 
 # =========================
@@ -442,9 +363,13 @@ def main() -> None:
     print(f"[device] {device}")
 
     # ---- load tokens with memmap ----
-    np_dtype = _dtype_from_str(train_cfg.token_dtype)
-    train_tokens = load_tokens_memmap(train_cfg.train_tokens_path, dtype=np_dtype)
-    val_tokens = load_tokens_memmap(train_cfg.val_tokens_path, dtype=np_dtype)
+    train_root = os.path.dirname(train_cfg.train_tokens_path) or "tokenized_ids"
+    train_name = os.path.basename(train_cfg.train_tokens_path)
+    val_root = os.path.dirname(train_cfg.val_tokens_path) or "tokenized_ids"
+    val_name = os.path.basename(train_cfg.val_tokens_path)
+
+    train_tokens = load_tokenized_ids(train_name, root_dir=train_root, mmap=True)
+    val_tokens = load_tokenized_ids(val_name, root_dir=val_root, mmap=True)
     print(f"[data] train_tokens={train_tokens.shape} val_tokens={val_tokens.shape} dtype={train_tokens.dtype}")
 
     # ---- build model (aligned with your TransformerLM) ----
@@ -474,6 +399,7 @@ def main() -> None:
     if train_cfg.wandb:
         try:
             import wandb  # type: ignore
+
             wandb_run = wandb.init(
                 project=train_cfg.wandb_project,
                 name=train_cfg.wandb_name,
@@ -486,20 +412,7 @@ def main() -> None:
     # ---- resume ----
     start_step = 0
     if train_cfg.resume:
-        if user_ckpt is None or not hasattr(user_ckpt, "load_checkpoint"):
-            ckpt = torch.load(train_cfg.resume, map_location="cpu")
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            start_step = int(ckpt["iteration"])
-        else:
-            start_step = int(
-                user_ckpt.load_checkpoint(
-                    src=train_cfg.resume,
-                    model=model,
-                    optimizer=optimizer,
-                )
-            )
-
+        start_step = int(load_checkpoint(src=train_cfg.resume, model=model, optimizer=optimizer))
         print(f"[resume] loaded from {train_cfg.resume} at iteration={start_step}")
 
     model.train()
@@ -519,7 +432,7 @@ def main() -> None:
             x, y = get_batch(train_tokens, train_cfg.batch_size, model_cfg.context_length, device)
             logits = model(x)  # (B,T,V)
 
-            loss = compute_loss_with_user_ce(logits, y) / train_cfg.grad_accum_steps
+            loss = user_cross_entropy(logits, y) / train_cfg.grad_accum_steps
             loss.backward()
             loss_accum += float(loss.item())
 
@@ -545,16 +458,17 @@ def main() -> None:
 
             print(
                 f"[step {step+1:>7}/{train_cfg.total_steps}] "
-                f"lr={lr:.3e} loss={avg_loss:.4f} ppl={ppl:.2f} tok/s={tok_s:.1f}"
+                f"loss={avg_loss:.4f} ppl={ppl:.2f} "
+                f"lr={lr:.3e} tok/s={tok_s:,.0f}"
             )
 
             if wandb_run is not None:
                 wandb_run.log(
                     {
-                        "train/lr": lr,
                         "train/loss": avg_loss,
                         "train/ppl": ppl,
-                        "perf/tok_s": tok_s,
+                        "train/lr": lr,
+                        "train/tok_s": tok_s,
                         "step": step + 1,
                     },
                     step=step + 1,
@@ -564,7 +478,7 @@ def main() -> None:
             t0 = time.time()
 
         # ---- eval ----
-        if (step + 1) % train_cfg.eval_every == 0:
+        if train_cfg.eval_every > 0 and ((step + 1) % train_cfg.eval_every == 0):
             losses = estimate_loss(
                 model=model,
                 train_tokens=train_tokens,
@@ -602,23 +516,12 @@ def main() -> None:
             ckpt_path = os.path.join(train_cfg.save_dir, f"ckpt_step_{step + 1}.pt")
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
-            if user_ckpt is None or not hasattr(user_ckpt, "save_checkpoint"):
-                # fallback（万一没导入成功）
-                torch.save(
-                    {
-                        "iteration": step + 1,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                    },
-                    ckpt_path,
-                )
-            else:
-                user_ckpt.save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    iteration=step + 1,
-                    out=ckpt_path,
-                )
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                iteration=step + 1,
+                out=ckpt_path,
+            )
 
             print(f"[ckpt] saved to {ckpt_path}")
 
@@ -628,4 +531,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
