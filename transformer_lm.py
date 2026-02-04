@@ -1,5 +1,5 @@
+# transformer_lm.py
 from __future__ import annotations
-
 
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -15,42 +15,45 @@ from Linear import Linear
 
 class TransformerLM(nn.Module):
     """
-        A GPT-style Transformer Language Model (causal LM).
+    A GPT-style Transformer Language Model (causal LM).
 
-        Forward:
-          input_ids: (B, T) int64
-          returns logits: (B, T, vocab_size)
+    Forward:
+      input_ids: (B, T) int64
+      returns logits: (B, T, vocab_size)
 
-        Components:
-          tok_emb: (vocab_size, d_model)
-          pos_emb: (context_length, d_model)
-          blocks: num_layers * TransformerBlock
-          norm_f: RMSNorm(d_model)
-          lm_head: Linear(d_model -> vocab_size), default ties weights with tok_emb
+    Components:
+      tok_emb: (vocab_size, d_model)
+      pos_emb: (context_length, d_model)
+      blocks: num_layers * TransformerBlock
+      norm_f: RMSNorm(d_model)
+      lm_head: Linear(d_model -> vocab_size)
+        - if tie_weights=True, lm_head has NO own parameter; it uses tok_emb.weight.T
 
-        Notes:
-          - Causality is enforced inside TransformerBlock's MHA (your implementation).
-          - RoPE token_positions are generated as arange(T) and passed into blocks.
-        """
+    Notes:
+      - Causality is enforced inside TransformerBlock's MHA (your implementation).
+      - token_positions are generated as arange(T) and passed into blocks (for RoPE).
+    """
 
-    def __init__(self,
-                 *,
-                 vocab_size: int,
-                 context_length: int,
-                 num_layers: int,
-                 d_model: int,
-                 num_heads: int,
-                 d_ff: int,
-                 dropout: float = 0.0,
-                 bias: bool = True,
-                 eps: float = 1e-5,
-                 rope_theta: float = 10000.0,
-                 use_rope: bool = True,
-                 max_seq_len: int = 4096,
-                 tie_weights: bool = True,
-                 emb_dropout: Optional[float] = None,
-                 device=None,
-                 dtype=None, ) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        context_length: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        eps: float = 1e-5,
+        rope_theta: float = 10000.0,
+        use_rope: bool = True,
+        max_seq_len: int = 4096,
+        tie_weights: bool = True,
+        emb_dropout: Optional[float] = None,
+        device=None,
+        dtype=None,
+    ) -> None:
         super().__init__()
 
         self.vocab_size = int(vocab_size)
@@ -81,10 +84,12 @@ class TransformerLM(nn.Module):
         if dtype is not None:
             factory_kwargs["dtype"] = dtype
 
+        # ---- Embeddings ----
         self.tok_emb = Embedding(self.vocab_size, self.d_model, **factory_kwargs)
         self.pos_emb = Embedding(self.context_length, self.d_model, **factory_kwargs)
         self.drop = nn.Dropout(self.emb_dropout)
 
+        # ---- Blocks ----
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -104,53 +109,53 @@ class TransformerLM(nn.Module):
             ]
         )
 
+        # ---- Final norm ----
         self.norm_f = RMSNorm(self.d_model, eps=self.eps, **factory_kwargs)
-        self.lm_head = Linear(self.d_model, self.vocab_size, **factory_kwargs)
+
+        # ---- LM head ----
+        # Always create Linear so your structure stays the same;
+        # if tie_weights=True, we REMOVE its parameter and bind W to tok_emb.weight.T.
+        self.lm_head = Linear(self.d_model, self.vocab_size, device=device, dtype=dtype)
 
         if self.tie_weights:
-            self.lm_head.weight = self.tok_emb.weight
+            # 1) Remove the registered Parameter "W" from lm_head
+            #    (otherwise PyTorch forbids assigning a Tensor to a Parameter field)
+            self.lm_head._parameters.pop("W", None)
 
+            # 2) Bind lm_head.W to a transpose VIEW of tok_emb.weight: (V,D).T -> (D,V)
+            #    This shares storage: gradients flow back into tok_emb.weight.
+            self.lm_head.W = self.tok_emb.weight.T
+
+        # ---- Init ----
         self._init_weights()
 
     def _init_weights(self) -> None:
+        # Embeddings
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
 
+        # lm_head:
+        # - if tie_weights=True: lm_head has no own parameter; do NOT init it.
+        # - else: init its independent W.
         if not self.tie_weights:
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.lm_head.W, mean=0.0, std=0.02)
 
-        for m in self.modules():
-            if isinstance(m, Linear):
-                if m is self.lm_head and self.tie_weights:
-                    continue
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # (Optional) If you want to init other modules, do it inside those modules' own __init__.
+        # Here we keep it minimal and safe given custom Linear stores weight as .W.
 
     @torch.no_grad()
     def get_token_position(self, T: int, device: torch.device) -> torch.Tensor:
         return torch.arange(T, device=device, dtype=torch.long)
 
-    def forward(self,
-                input_ids: torch.Tensor,
-                *,
-                targets: Optional[torch.Tensor] = None,
-                return_loss: bool = False,
-                shift_targets: bool = True,
-                ignore_index: Optional[int] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        input_ids: (B,T) long
-        targets:
-          - if provided and return_loss=True:
-              compute cross-entropy loss.
-              default shift_targets=True uses next-token prediction:
-                logits[:, :-1] vs targets[:, 1:]
-          - else returns logits only
-
-        returns:
-          - logits: (B,T,vocab_size)
-          - (logits, loss) if return_loss=True and targets is not None
-        """
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        targets: Optional[torch.Tensor] = None,
+        return_loss: bool = False,
+        shift_targets: bool = True,
+        ignore_index: Optional[int] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if input_ids.dim() != 2:
             raise ValueError(f"input_ids must be (B,T), got {tuple(input_ids.shape)}")
         if input_ids.dtype != torch.long:
@@ -158,12 +163,11 @@ class TransformerLM(nn.Module):
 
         B, T = input_ids.shape
         if T > self.context_length:
-            raise  ValueError(
-                f"Sequence length T={T} exceeds context_length={self.context_length}"
-            )
+            raise ValueError(f"Sequence length T={T} exceeds context_length={self.context_length}")
 
-        token_positions = self.get_token_position(T, device = input_ids.device)
+        token_positions = self.get_token_position(T, device=input_ids.device)
 
+        # (B,T,D)
         tok = self.tok_emb(input_ids)
         pos = self.pos_emb(token_positions).unsqueeze(0)
         x = self.drop(tok + pos)
@@ -172,15 +176,15 @@ class TransformerLM(nn.Module):
             x = blk(x, token_positions=token_positions)
 
         x = self.norm_f(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x)  # (B,T,V)
 
         if not (return_loss and targets is not None):
             return logits
 
         if targets.shape != input_ids.shape:
-            raise ValueError(f"targets must have shape (B,T) like input_ids,got {tuple(targets.shape)}")
+            raise ValueError(f"targets must have shape (B,T) like input_ids, got {tuple(targets.shape)}")
         if targets.dtype != torch.long:
-            raise TypeError(f"targets must be torch.long, got{targets.dtype}")
+            raise TypeError(f"targets must be torch.long, got {targets.dtype}")
 
         if ignore_index is None:
             if (targets == -100).any():
@@ -202,5 +206,5 @@ class TransformerLM(nn.Module):
             targets_use.view(-1),
             ignore_index=ignore_index,
         )
-        return logits,loss
+        return logits, loss
 

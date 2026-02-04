@@ -1,69 +1,265 @@
 # adapters.py
 from __future__ import annotations
 
-from typing import Optional
-
-
 from Linear import Linear
-
-
 
 from Embedding import Embedding
 
-
-import torch
 from RMSNorm import RMSNorm
-
 
 from positionwise_feedforward import PositionwiseFeedForward
 
 from rope import RotaryPositionalEmbedding
 
-
-import torch
-from softmax import softmax   # 如果你的文件路径不同，这里改成你的实际 import
-
-
-from typing import Optional
-import torch
+from softmax import softmax
 
 from scaled_dot_product_attention import scaled_dot_product_attention
 
-
-from typing import Optional
-import torch
-
 from transformer_block import TransformerBlock
 
-
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 from transformer_lm import TransformerLM
 
+from learning_rate_schedule import lr_cosine_with_warmup
 
-def run_transformer_lm(*args, **kwargs) -> TransformerLM:
+from typing import Iterable
+
+from typing import Tuple
+import numpy as np
+
+from typing import BinaryIO, IO, Union
+import os
+import torch
+
+from checkpointing import save_checkpoint, load_checkpoint
+
+
+PathOrFile = Union[str, os.PathLike, BinaryIO, IO[bytes]]
+
+
+def run_save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: PathOrFile,
+) -> None:
     """
-    Test adapter for TransformerLM.
-
-    Robust handling:
-      - run_transformer_lm(config_dict)
-      - run_transformer_lm(**config_kwargs)
-
-    Expected keys at minimum:
-      vocab_size, context_length, num_layers,
-      d_model, num_heads, d_ff
-    plus any TransformerBlock args (dropout, bias, eps, rope_theta, use_rope, max_seq_len, device, dtype, ...).
+    Adapter wrapper required by the assignment.
     """
-    if len(args) == 1 and isinstance(args[0], dict) and not kwargs:
-        cfg: Dict[str, Any] = args[0]
-        return TransformerLM(**cfg)
+    save_checkpoint(model=model, optimizer=optimizer, iteration=iteration, out=out)
 
-    if len(args) != 0:
-        raise TypeError(
-            "run_transformer_lm only supports run_transformer_lm(config_dict) or run_transformer_lm(**kwargs)"
+
+def run_load_checkpoint(
+    src: PathOrFile,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    """
+    Adapter wrapper required by the assignment.
+    """
+    return load_checkpoint(src=src, model=model, optimizer=optimizer)
+
+
+
+def run_get_batch(
+    x: np.ndarray,
+    batch_size: int,
+    context_length: int,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample a batch from a 1D token id sequence.
+
+    Args:
+        x: 1D numpy array of token ids, shape (n,), integer dtype
+        batch_size: B
+        context_length: T
+        device: 'cpu' | 'cuda:0' | 'mps' | ...
+
+    Returns:
+        x_batch: (B, T) torch.long on device
+        y_batch: (B, T) torch.long on device, where y is x shifted by 1
+    """
+    if not isinstance(x, (np.ndarray, np.memmap)):
+        raise TypeError(f"x must be a numpy array or memmap, got {type(x)}")
+    if x.ndim != 1:
+        raise ValueError(f"x must be 1D, got shape={x.shape}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    if context_length <= 0:
+        raise ValueError(f"context_length must be > 0, got {context_length}")
+    if not np.issubdtype(x.dtype, np.integer):
+        raise TypeError(f"x must contain integer token ids, got dtype={x.dtype}")
+
+    n = int(x.shape[0])
+    max_start = n - (context_length + 1)  # need i+T and i+T+1 to be valid
+    if max_start < 0:
+        raise ValueError(
+            f"Sequence too short: len(x)={n}, context_length={context_length} "
+            f"(need at least context_length+1 tokens)"
         )
 
-    return TransformerLM(**kwargs)
+    # sample B start indices uniformly from [0, max_start]
+    starts = np.random.randint(0, max_start + 1, size=(batch_size,), dtype=np.int64)
+
+    # build batches in numpy (works for memmap too)
+    xb = np.empty((batch_size, context_length), dtype=np.int64)
+    yb = np.empty((batch_size, context_length), dtype=np.int64)
+
+    for b, i in enumerate(starts):
+        i = int(i)
+        xb[b, :] = x[i : i + context_length]
+        yb[b, :] = x[i + 1 : i + context_length + 1]
+
+    # convert to torch and move to device
+    x_batch = torch.from_numpy(xb).to(device=device, dtype=torch.long)
+    y_batch = torch.from_numpy(yb).to(device=device, dtype=torch.long)
+    return x_batch, y_batch
+
+
+
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter],
+    max_norm: float,
+    eps: float = 1e-6,
+) -> float:
+    """
+    Adapter required by the assignment.
+
+    It should call your implementation and return the (pre-clip) norm.
+    """
+    # 兼容两种项目结构：
+    # 1) adapters.py 和 gradient_clipping.py 同级：from gradient_clipping import ...
+    # 2) adapters.py 在包内：from .gradient_clipping import ...
+    try:
+        from .gradient_clipping import clip_grad_l2_norm_
+    except Exception:
+        from gradient_clipping import clip_grad_l2_norm_
+
+    return clip_grad_l2_norm_(parameters, max_norm=max_norm, eps=eps)
+
+def get_lr_cosine_schedule(
+    t: int,
+    alpha_max: float,
+    alpha_min: float,
+    Tw: int,
+    Tc: int,
+) -> float:
+    """
+    Adapter API expected by the assignment/tests.
+    Delegates to the actual implementation in learning_rate_schedule.py
+    """
+    return lr_cosine_with_warmup(t=t, alpha_max=alpha_max, alpha_min=alpha_min, Tw=Tw, Tc=Tc)
+
+
+from cross_entropy import cross_entropy
+
+
+def run_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Assignment entrypoint. Delegates to cross_entropy.cross_entropy.
+    """
+    return cross_entropy(logits, targets)
+
+
+
+
+def _count_params_unique(model: torch.nn.Module) -> int:
+    """
+    Count parameters without double-counting shared Parameters (e.g., weight tying).
+    """
+    seen = set()
+    total = 0
+    for p in model.parameters():
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += p.numel()
+    return total
+
+
+def run_transformer_lm(
+    *args,
+    verbose: bool = True,
+    check_forward: bool = False,
+    forward_shape: Tuple[int, int] = (2, 8),   # (B,T) for quick check
+    device: Optional[str] = None,              # override device for quick check only
+    **kwargs,
+) -> TransformerLM:
+    """
+    Test adapter for TransformerLM, plus optional reporting.
+
+    Supported calls:
+      1) run_transformer_lm(config_dict)
+      2) run_transformer_lm(**config_kwargs)
+
+    Extra adapter-only kwargs (won't be passed into TransformerLM):
+      - verbose: print config + param counts
+      - check_forward: run a tiny forward to verify logits shape
+      - forward_shape: (B,T) used for check_forward
+      - device: device string for check_forward (e.g., "cuda"); if None uses model's device
+
+    Returns:
+      TransformerLM instance.
+    """
+    # -------- parse config --------
+    if len(args) == 1 and isinstance(args[0], dict) and not kwargs:
+        cfg: Dict[str, Any] = dict(args[0])  # copy
+    elif len(args) == 0:
+        cfg = dict(kwargs)  # copy
+    else:
+        raise TypeError("run_transformer_lm only supports run_transformer_lm(config_dict) or run_transformer_lm(**kwargs)")
+
+    # Pop adapter-only keys if user mistakenly included them inside cfg
+    cfg.pop("verbose", None)
+    cfg.pop("check_forward", None)
+    cfg.pop("forward_shape", None)
+    cfg.pop("device", None)
+
+    # -------- build model --------
+    model = TransformerLM(**cfg)
+
+    # -------- report --------
+    if verbose:
+        # Pull the most relevant hyperparams (if missing, show None)
+        def g(k: str, default=None):
+            return cfg.get(k, default)
+
+        total_params = _count_params_unique(model)
+        tied = bool(getattr(model, "tie_weights", False))
+
+        print("\n[TransformerLM config]")
+        print(f"  vocab_size     = {g('vocab_size')}")
+        print(f"  context_length = {g('context_length')}")
+        print(f"  num_layers     = {g('num_layers')}")
+        print(f"  d_model        = {g('d_model')}")
+        print(f"  num_heads      = {g('num_heads')}")
+        print(f"  d_ff           = {g('d_ff')}")
+        print(f"  dropout        = {g('dropout', 0.0)}")
+        print(f"  use_rope       = {g('use_rope', True)}")
+        print(f"  tie_weights    = {tied}")
+        print(f"[Params] unique params = {total_params:,}  (~{total_params/1e6:.2f} M)\n")
+
+    # -------- optional quick forward check --------
+    if check_forward:
+        V = int(cfg["vocab_size"])
+        B, T = forward_shape
+        # choose device for check
+        if device is not None:
+            model = model.to(device)
+            dev = torch.device(device)
+        else:
+            dev = next(model.parameters()).device
+
+        x = torch.randint(0, V, (B, T), dtype=torch.long, device=dev)
+        logits = model(x)
+        print(f"[Forward check] input: {(B,T)}  logits: {tuple(logits.shape)} (expected {(B,T,V)})")
+
+    return model
+
+
 
 
 
