@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from RMSNorm import RMSNorm
 from positionwise_feedforward import PositionwiseFeedForward  # 你的 SwiGLU FFN
-from multihead_self_attention import CasualMultiheadSelfAttention  # ✅ 你已改成“无 lazy init”的 MHA
+from multihead_self_attention import CausalMultiheadSelfAttention  # ✅ 你已改成“无 lazy init”的 MHA
 
 
 class TransformerBlock(nn.Module):
@@ -65,7 +65,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(self.d_model, eps=self.eps, device=device, dtype=dtype)
 
         # 2) MHA (✅ no lazy init)
-        self.attn = CasualMultiheadSelfAttention(
+        self.attn = CausalMultiheadSelfAttention(
             d_model=self.d_model,
             num_heads=self.num_heads,
             rope_theta=self.rope_theta,
