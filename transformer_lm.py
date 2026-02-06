@@ -86,7 +86,7 @@ class TransformerLM(nn.Module):
 
         # ---- Embeddings ----
         self.tok_emb = Embedding(self.vocab_size, self.d_model, **factory_kwargs)
-        self.pos_emb = Embedding(self.context_length, self.d_model, **factory_kwargs)
+        # self.pos_emb = Embedding(self.context_length, self.d_model, **factory_kwargs)
         self.drop = nn.Dropout(self.emb_dropout)
 
         # ---- Blocks ----
@@ -117,22 +117,13 @@ class TransformerLM(nn.Module):
         # if tie_weights=True, we REMOVE its parameter and bind W to tok_emb.weight.T.
         self.lm_head = Linear(self.d_model, self.vocab_size, device=device, dtype=dtype)
 
-        if self.tie_weights:
-            # 1) Remove the registered Parameter "W" from lm_head
-            #    (otherwise PyTorch forbids assigning a Tensor to a Parameter field)
-            self.lm_head._parameters.pop("W", None)
-
-            # 2) Bind lm_head.W to a transpose VIEW of tok_emb.weight: (V,D).T -> (D,V)
-            #    This shares storage: gradients flow back into tok_emb.weight.
-            self.lm_head.W = self.tok_emb.weight.T
-
         # ---- Init ----
         self._init_weights()
 
     def _init_weights(self) -> None:
         # Embeddings
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+        # nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
 
         # lm_head:
         # - if tie_weights=True: lm_head has no own parameter; do NOT init it.
@@ -169,14 +160,18 @@ class TransformerLM(nn.Module):
 
         # (B,T,D)
         tok = self.tok_emb(input_ids)
-        pos = self.pos_emb(token_positions).unsqueeze(0)
-        x = self.drop(tok + pos)
+        # pos = self.pos_emb(token_positions).unsqueeze(0)
+        x = self.drop(tok)
 
         for blk in self.blocks:
             x = blk(x, token_positions=token_positions)
 
         x = self.norm_f(x)
-        logits = self.lm_head(x)  # (B,T,V)
+        if self.tie_weights:
+            # tok_emb.weight: (V, D)  ->  (D, V)
+            logits = x @ self.tok_emb.weight.T  # (B,T,V)
+        else:
+            logits = self.lm_head(x)  # (B,T,V)
 
         if not (return_loss and targets is not None):
             return logits
