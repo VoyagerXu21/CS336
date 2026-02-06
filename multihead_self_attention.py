@@ -8,14 +8,20 @@ from rope import RotaryPositionalEmbedding
 from scaled_dot_product_attention import scaled_dot_product_attention
 
 
-def _make_causal_mask(max_seq_len: int, device: torch.device) -> torch.Tensor:
+def _make_causal_keep_mask(max_seq_len: int, device: torch.device) -> torch.Tensor:
     """
     Return shape (max_seq_len, max_seq_len) bool mask.
-    True means "masked out" (upper triangle, excluding diagonal).
+
+    IMPORTANT (aligned with your _masked_softmax semantics):
+      - mask == True  : keep / allowed attention
+      - mask == False : masked out (probability forced to 0)
+
+    Causal self-attention keep-mask = lower triangle (including diagonal).
+    i attends to j iff j <= i.
     """
-    return torch.triu(
+    return torch.tril(
         torch.ones(max_seq_len, max_seq_len, device=device, dtype=torch.bool),
-        diagonal=1,
+        diagonal=0,
     )
 
 
@@ -60,7 +66,7 @@ def _expand_positions_for_heads(
     raise ValueError(f"token_positions must be 1d/2d/3d, got dim={token_positions.dim()}")
 
 
-class CasualMultiheadSelfAttention(nn.Module):
+class CausalMultiheadSelfAttention(nn.Module):
     """
     Causal multi-head self-attention with optional RoPE.
 
@@ -113,36 +119,38 @@ class CasualMultiheadSelfAttention(nn.Module):
         else:
             self.rope = None
 
-        # ✅ Cache a big causal mask once (as buffer). Slice in forward.
-        # persistent=False: 不写进 state_dict（mask 可复现）
-        mask = _make_causal_mask(self.max_seq_len, device=(device if device is not None else torch.device("cpu")))
+        # ✅ Cache a big causal KEEP mask once (as buffer). Slice in forward.
+        # persistent=False: not saved in state_dict (re-creatable)
+        # NOTE: if device is None, create on CPU; buffer will move with module.to(device).
+        init_device = device if device is not None else torch.device("cpu")
+        mask = _make_causal_keep_mask(self.max_seq_len, device=init_device)
         self.register_buffer("causal_mask", mask, persistent=False)
 
     def _maybe_grow_rope_cache(self, needed_max_pos: int, device: torch.device) -> None:
         """
         If token_positions exceed current RoPE cache, grow it dynamically.
+        Also grow the causal mask accordingly.
         """
-        if not self.use_rope:
-            return
-        assert self.rope is not None
-
-        # 这里假设你的 RotaryPositionalEmbedding 有 max_seq_len 属性
-        if needed_max_pos <= self.rope.max_seq_len:
+        # grow causal mask regardless of rope, since T might exceed max_seq_len
+        if needed_max_pos <= self.causal_mask.shape[0]:
             return
 
         new_max = int(needed_max_pos)
         self.max_seq_len = new_max
-        self.rope = RotaryPositionalEmbedding(
-            theta=self.rope_theta,
-            d_k=self.head_dim,
-            max_seq_len=new_max,
-            device=device,
-        )
 
-        # 同步扩展 causal mask（否则 T 变大时 mask 不够切）
-        # 注意：buffer 会跟随 .to(device) 移动，所以这里用 self.causal_mask.device 即可
-        new_mask = _make_causal_mask(new_max, device=self.causal_mask.device)
-        self.causal_mask = new_mask  # 直接替换 buffer 张量（允许）
+        # grow RoPE cache if used
+        if self.use_rope:
+            assert self.rope is not None
+            self.rope = RotaryPositionalEmbedding(
+                theta=self.rope_theta,
+                d_k=self.head_dim,
+                max_seq_len=new_max,
+                device=device,
+            )
+
+        # grow causal KEEP mask on the same device as existing buffer
+        new_mask = _make_causal_keep_mask(new_max, device=self.causal_mask.device)
+        self.causal_mask = new_mask  # replace buffer tensor (allowed)
 
     def forward(
         self,
@@ -165,9 +173,8 @@ class CasualMultiheadSelfAttention(nn.Module):
         if token_positions is None:
             token_positions = torch.arange(T, device=device, dtype=torch.int64)
 
-        # Ensure mask capacity
+        # Ensure mask capacity (and rope cache if needed)
         if T > self.causal_mask.shape[0]:
-            # grow both rope cache and causal mask (safe even if use_rope=False)
             self._maybe_grow_rope_cache(needed_max_pos=T, device=device)
 
         # 1) Project: (B,T,D)
@@ -191,14 +198,14 @@ class CasualMultiheadSelfAttention(nn.Module):
                 device=device,
             )
             needed_max_pos = int(pos_bht.max().item()) + 1 if pos_bht.numel() > 0 else T
-            self._maybe_grow_rope_cache(needed_max_pos=needed_max_pos, device=device)
+            if needed_max_pos > self.causal_mask.shape[0]:
+                self._maybe_grow_rope_cache(needed_max_pos=needed_max_pos, device=device)
 
             q = self.rope(q, pos_bht)
             k = self.rope(k, pos_bht)
 
-        # 4) Causal mask slice: (T,T)
+        # 4) Causal KEEP mask slice: (T,T), True=keep, False=mask out
         causal_mask = self.causal_mask[:T, :T]
-        # 确保 mask 跟 x 在同一 device（一般 buffer 会自动跟随 module.to(device)）
         if causal_mask.device != device:
             causal_mask = causal_mask.to(device)
 
