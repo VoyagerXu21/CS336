@@ -262,9 +262,9 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
     # model core
     p.add_argument("--vocab_size", type=int, required=True)
     p.add_argument("--context_length", type=int, required=True)
-    p.add_argument("--num_layers", type=int, default=6)
-    p.add_argument("--d_model", type=int, default=384)
-    p.add_argument("--num_heads", type=int, default=6)
+    p.add_argument("--num_layers", type=int, default=4)
+    p.add_argument("--d_model", type=int, default=512)
+    p.add_argument("--num_heads", type=int, default=16)
 
     # SwiGLU d_ff
     p.add_argument(
@@ -313,7 +313,7 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
     p.add_argument("--lr_min", type=float, default=3e-5)
     p.add_argument("--warmup_steps", type=int, default=200)
     p.add_argument("--cosine_end_step", type=int, default=-1, help="Tc (if -1, uses total_steps-1)")
-    p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--optim_eps", type=float, default=1e-8)
@@ -656,3 +656,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
