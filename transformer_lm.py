@@ -25,7 +25,7 @@ class TransformerLM(nn.Module):
       tok_emb: (vocab_size, d_model)
       pos_emb: (context_length, d_model)
       blocks: num_layers * TransformerBlock
-      norm_f: RMSNorm(d_model)
+      norm_f: RMSNorm(d_model) or Identity
       lm_head: Linear(d_model -> vocab_size)
         - if tie_weights=True, lm_head has NO own parameter; it uses tok_emb.weight.T
 
@@ -50,6 +50,7 @@ class TransformerLM(nn.Module):
         use_rope: bool = True,
         max_seq_len: int = 4096,
         tie_weights: bool = True,
+        use_final_norm: bool = True,
         emb_dropout: Optional[float] = None,
         device=None,
         dtype=None,
@@ -73,6 +74,7 @@ class TransformerLM(nn.Module):
         self.max_seq_len = int(max_seq_len)
 
         self.tie_weights = bool(tie_weights)
+        self.use_final_norm = bool(use_final_norm)
 
         if emb_dropout is None:
             emb_dropout = dropout
@@ -110,7 +112,11 @@ class TransformerLM(nn.Module):
         )
 
         # ---- Final norm ----
-        self.norm_f = RMSNorm(self.d_model, eps=self.eps, **factory_kwargs)
+        self.norm_f = (
+            RMSNorm(self.d_model, eps=self.eps, **factory_kwargs)
+            if self.use_final_norm
+            else nn.Identity()
+        )
 
         # ---- LM head ----
         # Always create Linear so your structure stays the same;
@@ -202,4 +208,3 @@ class TransformerLM(nn.Module):
             ignore_index=ignore_index,
         )
         return logits, loss
-
