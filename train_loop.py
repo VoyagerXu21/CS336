@@ -59,6 +59,7 @@ class ModelCfg:
     use_rope: bool
     max_seq_len: int
     tie_weights: bool
+    use_final_norm: bool
     emb_dropout: Optional[float]
 
 
@@ -290,6 +291,7 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
     p.add_argument("--no_rope", action="store_true")
     p.add_argument("--max_seq_len", type=int, default=4096)
     p.add_argument("--no_tie_weights", action="store_true")
+    p.add_argument("--no_final_norm", action="store_true", help="Disable final RMSNorm in the LM head")
     p.add_argument("--emb_dropout", type=float, default=-1.0, help="If -1, LM uses dropout as emb_dropout")
 
     # train
@@ -340,6 +342,7 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
 
     use_rope = False if bool(args.no_rope) else True
     tie_weights = False if bool(args.no_tie_weights) else True
+    use_final_norm = False if bool(args.no_final_norm) else True
     emb_dropout = None if float(args.emb_dropout) < 0 else float(args.emb_dropout)
 
     model_cfg = ModelCfg(
@@ -356,6 +359,7 @@ def parse_args() -> Tuple[ModelCfg, OptimCfg, TrainCfg, int]:
         use_rope=bool(use_rope),
         max_seq_len=int(args.max_seq_len),
         tie_weights=bool(tie_weights),
+        use_final_norm=bool(use_final_norm),
         emb_dropout=emb_dropout,
     )
 
@@ -456,6 +460,7 @@ def main() -> None:
         use_rope=model_cfg.use_rope,
         max_seq_len=model_cfg.max_seq_len,
         tie_weights=model_cfg.tie_weights,
+        use_final_norm=model_cfg.use_final_norm,
         emb_dropout=model_cfg.emb_dropout,
     ).to(device)
 
