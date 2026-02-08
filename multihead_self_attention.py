@@ -103,10 +103,10 @@ class CausalMultiheadSelfAttention(nn.Module):
             factory_kwargs["dtype"] = dtype
 
         # Projections
-        self.w_q = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
-        self.w_k = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
-        self.w_v = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
-        self.w_o = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
+        self.w_q = nn.Linear(self.d_model, self.d_model, bias=True, **factory_kwargs)
+        self.w_k = nn.Linear(self.d_model, self.d_model, bias=True, **factory_kwargs)
+        self.w_v = nn.Linear(self.d_model, self.d_model, bias=True, **factory_kwargs)
+        self.w_o = nn.Linear(self.d_model, self.d_model, bias=True, **factory_kwargs)
 
         # RoPE
         if self.use_rope:
