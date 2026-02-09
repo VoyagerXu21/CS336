@@ -85,32 +85,24 @@ def get_batch(
         raise ValueError(f"context_length must be > 0, got {context_length}")
 
     n = int(x.shape[0])
-    # Need i+context_length to exist for input, and i+context_length+1 for targets
-    # i max = n - (context_length + 1)
-    max_start = n - (context_length + 1)
-    if max_start < 0:
+    if n <= context_length:
         raise ValueError(
             f"Sequence too short: len(x)={n}, context_length={context_length} "
             f"(need at least context_length+1 tokens)"
         )
 
-    # Sample start indices uniformly
-    starts = np.random.randint(0, max_start + 1, size=(batch_size,), dtype=np.int64)
+    x_t = torch.as_tensor(x)
+    starts = torch.randint(0, n - context_length, (batch_size,), dtype=torch.long)
+    offsets = torch.arange(context_length, dtype=torch.long).unsqueeze(0)
+    idx = starts.unsqueeze(1) + offsets
 
     # Build batch in numpy first (works for memmap too)
     # Use pre-allocation to avoid many small arrays
-    xb = np.empty((batch_size, context_length), dtype=np.int64)
-    yb = np.empty((batch_size, context_length), dtype=np.int64)
+    x_batch = x_t[idx]
+    y_batch = x_t[idx + 1]
 
-    for b, i in enumerate(starts):
-        i = int(i)
-        xb[b, :] = x[i : i + context_length]
-        yb[b, :] = x[i + 1 : i + context_length + 1]
-
-    # Convert to torch tensors and move to device
-    # torch.from_numpy shares memory with numpy array (xb/yb), which is fine here.
-    x_batch = torch.from_numpy(xb).to(device=device, dtype=torch.long, non_blocking=False)
-    y_batch = torch.from_numpy(yb).to(device=device, dtype=torch.long, non_blocking=False)
+    x_batch = x_batch.to(device)
+    y_batch = y_batch.to(device)
 
     return x_batch, y_batch
 
