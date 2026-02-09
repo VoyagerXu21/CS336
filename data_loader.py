@@ -91,18 +91,16 @@ def get_batch(
             f"(need at least context_length+1 tokens)"
         )
 
-    x_t = torch.as_tensor(x)
-    starts = torch.randint(0, n - context_length, (batch_size,), dtype=torch.long)
-    offsets = torch.arange(context_length, dtype=torch.long).unsqueeze(0)
-    idx = starts.unsqueeze(1) + offsets
+    starts = np.random.randint(0, n - context_length, size=batch_size)
+    offsets = np.arange(context_length)
+    idx = starts[:, None] + offsets[None, :]
 
     # Build batch in numpy first (works for memmap too)
-    # Use pre-allocation to avoid many small arrays
-    x_batch = x_t[idx]
-    y_batch = x_t[idx + 1]
+    x_batch = x[idx]
+    y_batch = x[idx + 1]
 
-    x_batch = x_batch.to(device)
-    y_batch = y_batch.to(device)
+    x_batch = torch.as_tensor(x_batch, dtype=torch.long, device=device)
+    y_batch = torch.as_tensor(y_batch, dtype=torch.long, device=device)
 
     return x_batch, y_batch
 
