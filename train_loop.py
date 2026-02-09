@@ -153,11 +153,7 @@ def set_optimizer_lr(optimizer: Any, lr: float) -> None:
     # Most torch-like optimizers
     if hasattr(optimizer, "param_groups"):
         for pg in optimizer.param_groups:
-            # some custom student optimizers may name lr as "alpha"
-            if "alpha" in pg:
-                pg["alpha"] = lr
-            else:
-                pg["lr"] = lr
+            pg["lr"] = lr
         return
     # custom optimizers
     if hasattr(optimizer, "lr"):
