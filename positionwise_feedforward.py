@@ -1,74 +1,51 @@
 # positionwise_feedforward.py
 from __future__ import annotations
 
-import math
 import torch
 import torch.nn as nn
 
 
-def _round_to_multiple(x: int, multiple: int) -> int:
-    """Round x up to the nearest multiple."""
-    return ((x + multiple - 1) // multiple) * multiple
+def _silu(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
 
 
 class PositionwiseFeedForward(nn.Module):
     """
-    SwiGLU Position-wise Feed-Forward Network.
+    SwiGLU Position-wise Feed-Forward Network (up/gate/down form).
 
     Implements:
-        y = W_out( (xW_g) * SiLU(xW_v) )
-    where SiLU(z) = z * sigmoid(z)
-
-    Notes:
-    - d_ff ≈ (8/3) * d_model
-    - d_ff must be a multiple of 64
+        y = W_down( SiLU(W_up x) * W_gate x )
     """
 
     def __init__(
         self,
         d_model: int,
+        d_ff: int,
         dropout: float = 0.0,
-        multiple_of: int = 64,
-        bias: bool = True,
+        bias: bool = False,
     ):
         super().__init__()
         if d_model <= 0:
             raise ValueError(f"d_model must be positive, got {d_model}")
-
-        # d_ff ≈ 8/3 * d_model, then round up to multiple_of (default 64)
-        d_ff_raw = int((8.0 / 3.0) * d_model)
-        d_ff = _round_to_multiple(max(1, d_ff_raw), multiple_of)
+        if d_ff <= 0:
+            raise ValueError(f"d_ff must be positive, got {d_ff}")
 
         self.d_model = int(d_model)
         self.d_ff = int(d_ff)
-
-        # One projection produces both gate/value parts: [*, 2*d_ff] -> split
-        self.in_proj = nn.Linear(self.d_model, 2 * self.d_ff, bias=bias)
-        self.out_proj = nn.Linear(self.d_ff, self.d_model, bias=bias)
         self.dropout = nn.Dropout(dropout)
 
-    @staticmethod
-    def _silu(x: torch.Tensor) -> torch.Tensor:
-        # numerically stable SiLU using sigmoid
-        return x * torch.sigmoid(x)
+        self.up = nn.Linear(self.d_model, self.d_ff, bias=bias)
+        self.gate = nn.Linear(self.d_model, self.d_ff, bias=bias)
+        self.down = nn.Linear(self.d_ff, self.d_model, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (..., d_model)
-        return: (..., d_model)
-        """
         if x.shape[-1] != self.d_model:
             raise ValueError(
                 f"Last dim of x must be d_model={self.d_model}, got {x.shape[-1]}"
             )
 
-        h = self.in_proj(x)                # (..., 2*d_ff)
-        x_g, x_v = h.chunk(2, dim=-1)      # (..., d_ff), (..., d_ff)
-
-        # SwiGLU: gate * SiLU(value)
-        y = x_g * self._silu(x_v)          # (..., d_ff)
-
-        y = self.out_proj(y)               # (..., d_model)
+        y = _silu(self.up(x)) * self.gate(x)
+        y = self.down(y)
         y = self.dropout(y)
         return y
 
@@ -77,6 +54,6 @@ class PositionwiseFeedForward(nn.Module):
 SwiGLUFeedForward = PositionwiseFeedForward
 
 
-def positionwise_feedforward(d_model: int, dropout: float = 0.0, **kwargs) -> PositionwiseFeedForward:
+def positionwise_feedforward(d_model: int, d_ff: int, dropout: float = 0.0, **kwargs) -> PositionwiseFeedForward:
     """Factory function (optional)."""
-    return PositionwiseFeedForward(d_model=d_model, dropout=dropout, **kwargs)
+    return PositionwiseFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, **kwargs)
