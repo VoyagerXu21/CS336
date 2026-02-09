@@ -78,32 +78,14 @@ class TransformerBlock(nn.Module):
         # 3) FFN (reuse your SwiGLU FFN, but force d_ff to match external argument)
         self.ff = PositionwiseFeedForward(
             d_model=self.d_model,
+            d_ff=self.d_ff,
             dropout=self.dropout,
-            multiple_of=1,  # don't force alignment to avoid mismatch with explicit d_ff in tests
             bias=self.bias,
         )
-        self._force_ff_dff(**factory_kwargs)
 
         # 4) Residual dropouts
         self.resid_dropout1 = nn.Dropout(self.dropout)
         self.resid_dropout2 = nn.Dropout(self.dropout)
-
-    def _force_ff_dff(self, **factory_kwargs) -> None:
-        """
-        Force PositionwiseFeedForward to use the externally provided d_ff.
-        This avoids test failures when tests explicitly pass d_ff.
-        """
-        if not hasattr(self.ff, "d_ff"):
-            return
-
-        if int(self.ff.d_ff) == self.d_ff:
-            return
-
-        # rebuild layers: in_proj: d_model -> 2*d_ff, out_proj: d_ff -> d_model
-        self.ff.d_ff = int(self.d_ff)
-        self.ff.in_proj = nn.Linear(self.d_model, 2 * self.d_ff, bias=self.bias, **factory_kwargs)
-        self.ff.out_proj = nn.Linear(self.d_ff, self.d_model, bias=self.bias, **factory_kwargs)
-        self.ff.dropout = nn.Dropout(self.dropout)
 
     def forward(self, x: torch.Tensor, token_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
